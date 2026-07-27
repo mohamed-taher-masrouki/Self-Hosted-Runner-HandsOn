@@ -1,0 +1,152 @@
+name: Book nRF On Local ECW Backend
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: ECW backend base URL reachable from the self-hosted runner
+        required: true
+        default: http://localhost:8002
+      board_search:
+        description: Board name text to search before booking
+        required: true
+        default: nrf
+
+jobs:
+  book-nrf:
+    name: Login, list board types, and book nRF
+    runs-on: [self-hosted, HandsOn]
+
+    env:
+      ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      BOARD_SEARCH: ${{ inputs.board_search || 'nrf' }}
+
+    steps:
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_EMAIL}" ] || [ -z "${ECW_PASSWORD}" ]; then
+            echo "Missing ECW_EMAIL or ECW_PASSWORD repository secret."
+            echo "Set ECW_EMAIL=user25@example.com and ECW_PASSWORD to the ECW account password."
+            exit 1
+          fi
+
+      - name: Check backend health
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            "${ECW_BACKEND_URL%/}/docs" \
+            --output /dev/null
+
+      - name: Login and store token
+        run: |
+          set -euo pipefail
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
+
+      - name: List board types and choose nRF
+        run: |
+          set -euo pipefail
+
+          board_types_response="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            "${ECW_BACKEND_URL%/}/board_types?page_no=1&page_size=100")"
+
+          echo "${board_types_response}" > board_types.json
+
+          python3 - "${BOARD_SEARCH}" <<'PY'
+          import json
+          import sys
+
+          search = sys.argv[1].lower()
+
+          with open("board_types.json", encoding="utf-8") as board_types_file:
+              board_types = json.load(board_types_file)
+
+          if isinstance(board_types, dict):
+              board_types = (
+                  board_types.get("items")
+                  or board_types.get("board_types")
+                  or board_types.get("results")
+                  or board_types.get("data")
+                  or []
+              )
+
+          print("Available board types:")
+          for board_type in board_types:
+              print(f"- {board_type.get('board_name')} (id: {board_type.get('id')})")
+
+          matches = [
+              board_type
+              for board_type in board_types
+              if search in str(board_type.get("board_name", "")).lower()
+          ]
+
+          if not matches:
+              print(f"No board type found containing '{search}'.", file=sys.stderr)
+              sys.exit(1)
+
+          selected = matches[0]
+          board_name = selected.get("board_name", "")
+          if not board_name:
+              print("Selected board type did not include board_name.", file=sys.stderr)
+              sys.exit(1)
+
+          with open("selected_board_name.txt", "w", encoding="utf-8") as board_name_file:
+              board_name_file.write(board_name)
+
+          print(f"Selected board type: {board_name} (id: {selected.get('id')})")
+          PY
+
+          {
+            echo "ECW_BOARD_NAME<<EOF"
+            cat selected_board_name.txt
+            echo
+            echo "EOF"
+          } >> "${GITHUB_ENV}"
+
+      - name: Book selected nRF board
+        run: |
+          set -euo pipefail
+
+          booking_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --get \
+            --data-urlencode "board_name=${ECW_BOARD_NAME}" \
+            "${ECW_BACKEND_URL%/}/auto-bookings")"
+
+          echo "${booking_response}" > booking.json
+
+          python3 <<'PY'
+          import json
+
+          with open("booking.json", encoding="utf-8") as booking_file:
+              booking = json.load(booking_file)
+
+          print("Reservation created:")
+          print(f"- Booking ID: {booking.get('id')}")
+          print(f"- Start time: {booking.get('start_time')}")
+          print(f"- End time: {booking.get('end_time')}")
+          PY
