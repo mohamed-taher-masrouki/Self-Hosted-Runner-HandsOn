@@ -18,7 +18,7 @@ on:
 jobs:
   book-nrf:
     name: Login, list board types, and book nRF
-    runs-on: [self-hosted, HandsOn]
+    runs-on: self-hosted
 
     env:
       ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
