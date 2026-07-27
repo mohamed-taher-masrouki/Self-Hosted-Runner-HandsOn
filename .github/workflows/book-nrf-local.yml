@@ -216,6 +216,7 @@ jobs:
           from pathlib import Path
 
           import websockets
+          from websockets.exceptions import ConnectionClosed
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
           token = os.environ["ECW_TOKEN"]
@@ -301,21 +302,30 @@ jobs:
                   capture_file.write(f"websocket_url={url}\n")
                   capture_file.write("--- serial ---\n")
 
-                  async with websockets.connect(url, **connect_kwargs) as websocket:
-                      end_time = time.monotonic() + 5
-                      while True:
-                          remaining = end_time - time.monotonic()
-                          if remaining <= 0:
-                              break
-                          try:
-                              message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
-                          except asyncio.TimeoutError:
-                              break
-                          if isinstance(message, bytes):
-                              message = message.decode("utf-8", errors="replace")
-                          capture_file.write(str(message))
-                          if not str(message).endswith("\n"):
-                              capture_file.write("\n")
+                  try:
+                      async with websockets.connect(url, **connect_kwargs) as websocket:
+                          end_time = time.monotonic() + 5
+                          while True:
+                              remaining = end_time - time.monotonic()
+                              if remaining <= 0:
+                                  break
+                              try:
+                                  message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                              except asyncio.TimeoutError:
+                                  break
+                              except ConnectionClosed as exc:
+                                  capture_file.write(
+                                      f"[websocket closed] code={exc.code} reason={exc.reason}\n"
+                                  )
+                                  break
+
+                              if isinstance(message, bytes):
+                                  message = message.decode("utf-8", errors="replace")
+                              capture_file.write(str(message))
+                              if not str(message).endswith("\n"):
+                                  capture_file.write("\n")
+                  except Exception as exc:
+                      capture_file.write(f"[serial capture error] {type(exc).__name__}: {exc}\n")
 
                   capture_file.write("--- end serial ---\n")
                   capture_file.write(f"capture_finished={datetime.now(timezone.utc).isoformat()}\n")
