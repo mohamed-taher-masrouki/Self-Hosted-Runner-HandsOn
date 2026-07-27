@@ -1,6 +1,8 @@
 name: Book nRF On Local ECW Backend
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   push:
     branches:
       - develop
@@ -18,6 +20,7 @@ on:
 jobs:
   book-nrf:
     name: Login, list board types, and book nRF
+    if: github.event_name != 'schedule'
     runs-on: self-hosted
 
     env:
@@ -357,3 +360,210 @@ jobs:
           name: nrf-reservation-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: warn
+
+  time-tracker:
+    name: Check nRF availability
+    if: github.event_name == 'schedule'
+    runs-on: self-hosted
+
+    outputs:
+      available: ${{ steps.check-availability.outputs.available }}
+      board_info: ${{ steps.check-availability.outputs.board_info }}
+
+    env:
+      ECW_BACKEND_URL: http://localhost:8002
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      BOARD_SEARCH: nrf
+
+    steps:
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_EMAIL}" ] || [ -z "${ECW_PASSWORD}" ]; then
+            echo "Missing ECW_EMAIL or ECW_PASSWORD repository secret."
+            exit 1
+          fi
+
+      - name: Check backend health
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            "${ECW_BACKEND_URL%/}/docs" \
+            --output /dev/null
+
+      - name: Login and store token
+        run: |
+          set -euo pipefail
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
+
+      - name: Check nRF availability
+        id: check-availability
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          search = os.environ["BOARD_SEARCH"].lower()
+
+          def get_json(path: str, params: dict[str, str] | None = None) -> object:
+              query = ""
+              if params:
+                  query = "?" + urllib.parse.urlencode(params)
+              request = urllib.request.Request(
+                  f"{backend_url}{path}{query}",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          board_types = get_json("/board_types", {"page_no": "1", "page_size": "100"})
+          if isinstance(board_types, dict):
+              board_types = (
+                  board_types.get("items")
+                  or board_types.get("board_types")
+                  or board_types.get("results")
+                  or board_types.get("data")
+                  or []
+              )
+
+          matches = [
+              board_type
+              for board_type in board_types
+              if search in str(board_type.get("board_name", "")).lower()
+          ]
+          if not matches:
+              raise SystemExit(f"No board type found containing '{search}'.")
+
+          selected = matches[0]
+          start = datetime.now(timezone.utc).replace(microsecond=0)
+          end = start + timedelta(minutes=30)
+
+          availability = get_json(
+              "/availability",
+              {
+                  "start_iso": start.isoformat(),
+                  "end_iso": end.isoformat(),
+                  "tz": "UTC",
+                  "type_id_list": str(selected["id"]),
+              },
+          )
+
+          available_slots = [
+              slot
+              for slot in availability
+              if int(slot.get("available", 0)) > 0
+          ]
+          has_available = bool(available_slots)
+
+          board_info = {
+              "checked_at": start.isoformat(),
+              "window": {
+                  "start": start.isoformat(),
+                  "end": end.isoformat(),
+                  "timezone": "UTC",
+              },
+              "board": selected,
+              "availability": availability,
+              "available_slots": available_slots,
+              "has_available_booking": has_available,
+          }
+
+          compact_info = json.dumps(board_info, separators=(",", ":"))
+          print(f"nRF availability found: {has_available}")
+          print(json.dumps(board_info, indent=2))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"available={str(has_available).lower()}\n")
+              output.write(f"board_info={compact_info}\n")
+          PY
+
+  board-info-artifact:
+    name: Generate nRF board artifact
+    needs: time-tracker
+    if: needs.time-tracker.outputs.available == 'true'
+    runs-on: self-hosted
+
+    env:
+      BOARD_INFO_JSON: ${{ needs.time-tracker.outputs.board_info }}
+
+    steps:
+      - name: Generate board info artifact files
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts/board-info
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          board_info = json.loads(os.environ["BOARD_INFO_JSON"])
+          board = board_info["board"]
+          artifact_dir = Path("artifacts/board-info")
+
+          (artifact_dir / "nrf-board-info.json").write_text(
+              json.dumps(board_info, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# nRF Board Availability",
+              "",
+              f"- Checked at: {board_info['checked_at']}",
+              f"- Window start: {board_info['window']['start']}",
+              f"- Window end: {board_info['window']['end']}",
+              f"- Board name: {board.get('board_name')}",
+              f"- Board type ID: {board.get('id')}",
+              f"- Processor: {board.get('processor_type')}",
+              f"- Memory: {board.get('memory')}",
+              f"- GPIO pins: {board.get('gpio_pins')}",
+              f"- Status: {board.get('board_type_status')}",
+              f"- MCU: {board.get('is_mcu')}",
+              "",
+              "## Available Slots",
+          ]
+
+          for slot in board_info["available_slots"]:
+              lines.append(
+                  f"- {slot.get('start')} to {slot.get('end')}: "
+                  f"{slot.get('available')} available"
+              )
+
+          (artifact_dir / "nrf-board-info.md").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload board info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf-board-info-${{ github.run_id }}
+          path: artifacts/board-info/
+          if-no-files-found: error
