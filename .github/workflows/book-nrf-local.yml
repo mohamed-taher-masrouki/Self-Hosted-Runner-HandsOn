@@ -5,6 +5,7 @@ on:
     - cron: "*/5 * * * *"
   push:
     branches:
+      - main
       - develop
   workflow_dispatch:
     inputs:
@@ -20,7 +21,7 @@ on:
 jobs:
   book-nrf:
     name: Login, list board types, and book nRF
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: self-hosted
 
     env:
@@ -363,7 +364,7 @@ jobs:
 
   time-tracker:
     name: Check nRF availability
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: self-hosted
 
     outputs:
@@ -371,10 +372,10 @@ jobs:
       board_info: ${{ steps.check-availability.outputs.board_info }}
 
     env:
-      ECW_BACKEND_URL: http://localhost:8002
+      ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
       ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
       ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
-      BOARD_SEARCH: nrf
+      BOARD_SEARCH: ${{ inputs.board_search || 'nrf' }}
 
     steps:
       - name: Check required secrets
