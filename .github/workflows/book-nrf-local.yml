@@ -130,6 +130,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p artifacts
+
           booking_response="$(curl --fail --silent --show-error \
             --request POST \
             --header "Authorization: Bearer ${ECW_TOKEN}" \
@@ -141,12 +143,207 @@ jobs:
 
           python3 <<'PY'
           import json
+          import os
+          from pathlib import Path
 
           with open("booking.json", encoding="utf-8") as booking_file:
               booking = json.load(booking_file)
 
+          booking_id = booking.get("id")
+          start_time = booking.get("start_time")
+          end_time = booking.get("end_time")
+
+          if not booking_id or not start_time or not end_time:
+              raise SystemExit("Booking response is missing id, start_time, or end_time.")
+
+          Path("artifacts/reservation.json").write_text(
+              json.dumps(booking, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"ECW_BOOKING_ID={booking_id}\n")
+              env_file.write(f"ECW_BOOKING_START={start_time}\n")
+              env_file.write(f"ECW_BOOKING_END={end_time}\n")
+
           print("Reservation created:")
-          print(f"- Booking ID: {booking.get('id')}")
-          print(f"- Start time: {booking.get('start_time')}")
-          print(f"- End time: {booking.get('end_time')}")
+          print(f"- Booking ID: {booking_id}")
+          print(f"- Start time: {start_time}")
+          print(f"- End time: {end_time}")
           PY
+
+      - name: Ensure WebSocket client dependency
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import importlib.util
+          import subprocess
+          import sys
+
+          if importlib.util.find_spec("websockets") is None:
+              install_command = [
+                  sys.executable,
+                  "-m",
+                  "pip",
+                  "install",
+                  "--user",
+                  "websockets",
+              ]
+              try:
+                  subprocess.check_call(install_command)
+              except subprocess.CalledProcessError:
+                  subprocess.check_call(install_command + ["--break-system-packages"])
+
+          if importlib.util.find_spec("websockets") is None:
+              raise SystemExit("Python package 'websockets' is not available after install.")
+          PY
+
+      - name: Capture serial console for 5 seconds
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import asyncio
+          import base64
+          import inspect
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import websockets
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          booking_id = os.environ["ECW_BOOKING_ID"]
+          artifact_dir = Path("artifacts")
+          artifact_dir.mkdir(exist_ok=True)
+          capture_path = artifact_dir / "serial-capture.txt"
+
+          def parse_datetime(value: str) -> datetime:
+              if value.endswith("Z"):
+                  value = value[:-1] + "+00:00"
+              parsed = datetime.fromisoformat(value)
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=timezone.utc)
+              return parsed.astimezone(timezone.utc)
+
+          def token_cookie_name(jwt_token: str) -> str:
+              try:
+                  payload = jwt_token.split(".")[1]
+                  payload += "=" * (-len(payload) % 4)
+                  decoded = json.loads(base64.urlsafe_b64decode(payload))
+                  audience = decoded.get("aud")
+                  if isinstance(audience, list) and audience:
+                      return str(audience[0])
+                  if isinstance(audience, str):
+                      return audience
+              except Exception:
+                  pass
+              return "edgebenchuser"
+
+          def get_booking() -> dict:
+              url = f"{backend_url}/booking?booking_id={urllib.parse.quote(booking_id)}"
+              request = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def websocket_url() -> str:
+              parsed = urllib.parse.urlparse(backend_url)
+              scheme = "wss" if parsed.scheme == "https" else "ws"
+              return urllib.parse.urlunparse(
+                  parsed._replace(scheme=scheme, path=f"/console/{booking_id}", params="", query="", fragment="")
+              )
+
+          print(f"Waiting for booking {booking_id} to become active...")
+          deadline = time.monotonic() + 120
+          while True:
+              booking = get_booking()
+              start = parse_datetime(booking["start_utc"])
+              end = parse_datetime(booking["end_utc"])
+              now = datetime.now(timezone.utc)
+
+              if start <= now <= end:
+                  break
+              if now > end:
+                  raise SystemExit(f"Booking {booking_id} ended before serial capture could start.")
+              if time.monotonic() > deadline:
+                  raise SystemExit(f"Booking {booking_id} did not become active within 120 seconds.")
+
+              wait_seconds = min(max((start - now).total_seconds() + 0.5, 0.5), 5)
+              print(f"Booking starts at {start.isoformat()}, waiting {wait_seconds:.1f}s...")
+              time.sleep(wait_seconds)
+
+          async def capture() -> None:
+              headers = [
+                  ("Authorization", f"Bearer {token}"),
+                  ("Cookie", f"{token_cookie_name(token)}={token}"),
+              ]
+              connect_kwargs = {}
+              signature = inspect.signature(websockets.connect)
+              if "additional_headers" in signature.parameters:
+                  connect_kwargs["additional_headers"] = headers
+              else:
+                  connect_kwargs["extra_headers"] = headers
+
+              url = websocket_url()
+              with capture_path.open("w", encoding="utf-8") as capture_file:
+                  capture_file.write(f"booking_id={booking_id}\n")
+                  capture_file.write(f"board_name={os.environ.get('ECW_BOARD_NAME', '')}\n")
+                  capture_file.write(f"capture_started={datetime.now(timezone.utc).isoformat()}\n")
+                  capture_file.write(f"websocket_url={url}\n")
+                  capture_file.write("--- serial ---\n")
+
+                  async with websockets.connect(url, **connect_kwargs) as websocket:
+                      end_time = time.monotonic() + 5
+                      while True:
+                          remaining = end_time - time.monotonic()
+                          if remaining <= 0:
+                              break
+                          try:
+                              message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                          except asyncio.TimeoutError:
+                              break
+                          if isinstance(message, bytes):
+                              message = message.decode("utf-8", errors="replace")
+                          capture_file.write(str(message))
+                          if not str(message).endswith("\n"):
+                              capture_file.write("\n")
+
+                  capture_file.write("--- end serial ---\n")
+                  capture_file.write(f"capture_finished={datetime.now(timezone.utc).isoformat()}\n")
+
+          asyncio.run(capture())
+          print(f"Serial capture saved to {capture_path}")
+          PY
+
+      - name: End reservation
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_TOKEN:-}" ]; then
+            echo "No booking/token available; skipping reservation cleanup."
+            exit 0
+          fi
+
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --get \
+            --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
+            "${ECW_BACKEND_URL%/}/cancel-booking"
+
+      - name: Upload reservation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nrf-reservation-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
