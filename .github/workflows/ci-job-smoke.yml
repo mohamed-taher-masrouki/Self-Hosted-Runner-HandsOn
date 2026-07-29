@@ -1,0 +1,400 @@
+name: ECW CI Job Smoke
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: ECW backend base URL reachable from the self-hosted runner
+        required: true
+        default: http://localhost:8002
+      board_search:
+        description: Board name text to search before auto-booking
+        required: true
+        default: nrf
+      booking_wait_timeout_seconds:
+        description: Maximum seconds to wait for the auto booking to become active
+        required: true
+        default: "180"
+      job_wait_timeout_seconds:
+        description: Maximum seconds to wait for the CI job to finish
+        required: true
+        default: "180"
+
+jobs:
+  ci-job-smoke:
+    name: Auto-book board and run CI wait job
+    runs-on: self-hosted
+
+    env:
+      ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      BOARD_SEARCH: ${{ inputs.board_search || 'nrf' }}
+      BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '180' }}
+      JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
+
+    steps:
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_EMAIL}" ] || [ -z "${ECW_PASSWORD}" ]; then
+            echo "Missing ECW_EMAIL or ECW_PASSWORD repository secret."
+            exit 1
+          fi
+
+      - name: Check backend health
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            "${ECW_BACKEND_URL%/}/docs" \
+            --output /dev/null
+
+      - name: Login and store token
+        run: |
+          set -euo pipefail
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
+
+      - name: Select board type
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          board_types_response="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            "${ECW_BACKEND_URL%/}/board_types?page_no=1&page_size=100")"
+
+          echo "${board_types_response}" > artifacts/board-types.json
+
+          python3 - "${BOARD_SEARCH}" <<'PY'
+          import json
+          import os
+          import sys
+
+          search = sys.argv[1].lower()
+
+          with open("artifacts/board-types.json", encoding="utf-8") as board_types_file:
+              board_types = json.load(board_types_file)
+
+          if isinstance(board_types, dict):
+              board_types = (
+                  board_types.get("items")
+                  or board_types.get("board_types")
+                  or board_types.get("results")
+                  or board_types.get("data")
+                  or []
+              )
+
+          matches = [
+              board_type
+              for board_type in board_types
+              if search in str(board_type.get("board_name", "")).lower()
+          ]
+
+          if not matches:
+              raise SystemExit(f"No board type found containing '{search}'.")
+
+          selected = matches[0]
+          board_name = selected.get("board_name", "")
+          if not board_name:
+              raise SystemExit("Selected board type did not include board_name.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"ECW_BOARD_NAME={board_name}\n")
+
+          print(f"Selected board type: {board_name} (id: {selected.get('id')})")
+          PY
+
+      - name: Create auto booking
+        run: |
+          set -euo pipefail
+
+          booking_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --get \
+            --data-urlencode "board_name=${ECW_BOARD_NAME}" \
+            "${ECW_BACKEND_URL%/}/auto-bookings")"
+
+          echo "${booking_response}" > artifacts/booking.json
+
+          python3 <<'PY'
+          import json
+          import os
+
+          with open("artifacts/booking.json", encoding="utf-8") as booking_file:
+              booking = json.load(booking_file)
+
+          booking_id = booking.get("id")
+          if not booking_id:
+              raise SystemExit("Booking response is missing id.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"ECW_BOOKING_ID={booking_id}\n")
+
+          print(f"Created booking: {booking_id}")
+          PY
+
+      - name: Wait for booking to become active
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          booking_id = os.environ["ECW_BOOKING_ID"]
+          timeout_seconds = int(os.environ["BOOKING_WAIT_TIMEOUT_SECONDS"])
+
+          def parse_datetime(value: str) -> datetime:
+              if value.endswith("Z"):
+                  value = value[:-1] + "+00:00"
+              parsed = datetime.fromisoformat(value)
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=timezone.utc)
+              return parsed.astimezone(timezone.utc)
+
+          def get_booking() -> dict:
+              query = urllib.parse.urlencode({"booking_id": booking_id})
+              request = urllib.request.Request(
+                  f"{backend_url}/booking?{query}",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          deadline = time.monotonic() + timeout_seconds
+          print(f"Waiting for booking {booking_id} to become active...")
+
+          while True:
+              booking = get_booking()
+              start = parse_datetime(booking["start_utc"])
+              end = parse_datetime(booking["end_utc"])
+              status = str(booking.get("status", "")).lower()
+              now = datetime.now(timezone.utc)
+
+              active = start <= now < end and status in {"active", "confirmed"}
+              if active:
+                  print(f"Booking {booking_id} is active.")
+                  break
+
+              if now >= end:
+                  raise SystemExit(f"Booking {booking_id} ended before it became active.")
+              if time.monotonic() > deadline:
+                  raise SystemExit(
+                      f"Booking {booking_id} did not become active within "
+                      f"{timeout_seconds} seconds."
+                  )
+
+              wait_seconds = min(max((start - now).total_seconds() + 0.5, 1), 5)
+              print(
+                  f"Booking status={status}, starts={start.isoformat()}, "
+                  f"waiting {wait_seconds:.1f}s..."
+              )
+              time.sleep(wait_seconds)
+          PY
+
+      - name: Create CI job with 10-second wait
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          booking_id = int(os.environ["ECW_BOOKING_ID"])
+
+          payload = {
+              "booking_id": booking_id,
+              "name": "GitHub Actions 10 second CI smoke",
+              "description": "Auto-created by Self-Hosted-Runner-HandsOn workflow.",
+              "steps": [
+                  {
+                      "id": "wait_10s",
+                      "name": "Reset board and wait 10 seconds",
+                      "do": {
+                          "type": "action",
+                          "target": "board",
+                          "command": "reset",
+                          "parameters": {
+                              "strategy": "serial_command",
+                          },
+                      },
+                      "wait": {
+                          "type": "delay",
+                          "timeout_ms": 10000,
+                      },
+                      "expect": {
+                          "source": "operation.result",
+                          "operator": "exists",
+                      },
+                      "on_failure": {
+                          "retries": 0,
+                          "stop_job": True,
+                      },
+                  }
+              ],
+          }
+
+          request = urllib.request.Request(
+              f"{backend_url}/api/v1/jobs",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              job = json.loads(response.read().decode("utf-8"))
+
+          with open("artifacts/ci-job-created.json", "w", encoding="utf-8") as job_file:
+              json.dump(job, job_file, indent=2)
+              job_file.write("\n")
+
+          job_id = job.get("id")
+          if not job_id:
+              raise SystemExit("CI job creation response is missing id.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"ECW_CI_JOB_ID={job_id}\n")
+
+          print(f"Created CI job: {job_id}")
+          PY
+
+      - name: Poll CI job status and report result
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          job_id = os.environ["ECW_CI_JOB_ID"]
+          timeout_seconds = int(os.environ["JOB_WAIT_TIMEOUT_SECONDS"])
+          artifact_dir = Path("artifacts")
+
+          def get_json(path: str) -> dict:
+              request = urllib.request.Request(
+                  f"{backend_url}{path}",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          deadline = time.monotonic() + timeout_seconds
+          final_job = None
+
+          while True:
+              job = get_json(f"/api/v1/jobs/{job_id}")
+              status = str(job.get("status", "")).lower()
+              print(f"CI job {job_id} status: {status}")
+
+              if status in {"passed", "failed", "cancelled"}:
+                  final_job = job
+                  break
+
+              if time.monotonic() > deadline:
+                  final_job = job
+                  status = "timeout"
+                  print(f"CI job {job_id} did not finish within {timeout_seconds}s.")
+                  break
+
+              time.sleep(2)
+
+          logs = get_json(f"/api/v1/jobs/{job_id}/logs")
+          results = get_json(f"/api/v1/jobs/{job_id}/results")
+
+          (artifact_dir / "ci-job-final.json").write_text(
+              json.dumps(final_job, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          (artifact_dir / "ci-job-logs.json").write_text(
+              json.dumps(logs, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          (artifact_dir / "ci-job-results.json").write_text(
+              json.dumps(results, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          final_status = str(final_job.get("status", "timeout")).lower()
+          summary = [
+              "# ECW CI Job Smoke Result",
+              "",
+              f"- Job ID: {job_id}",
+              f"- Final status: {final_status}",
+              f"- Booking ID: {os.environ.get('ECW_BOOKING_ID', '')}",
+              f"- Board: {os.environ.get('ECW_BOARD_NAME', '')}",
+              "",
+          ]
+          (artifact_dir / "ci-job-summary.md").write_text(
+              "\n".join(summary),
+              encoding="utf-8",
+          )
+
+          if final_status == "passed":
+              print(f"PASS: CI job {job_id} passed.")
+              raise SystemExit(0)
+
+          print(f"FAIL: CI job {job_id} finished with status {final_status}.")
+          raise SystemExit(1)
+          PY
+
+      - name: End reservation
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_TOKEN:-}" ]; then
+            echo "No booking/token available; skipping reservation cleanup."
+            exit 0
+          fi
+
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --get \
+            --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
+            "${ECW_BACKEND_URL%/}/cancel-booking"
+
+      - name: Upload CI job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-job-smoke-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
