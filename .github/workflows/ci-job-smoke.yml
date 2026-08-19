@@ -220,7 +220,7 @@ jobs:
               time.sleep(wait_seconds)
           PY
 
-      - name: Create CI job with 10-second wait
+      - name: Create wait, serial, and camera CI jobs
         run: |
           set -euo pipefail
 
@@ -233,65 +233,98 @@ jobs:
           token = os.environ["ECW_TOKEN"]
           booking_id = int(os.environ["ECW_BOOKING_ID"])
 
-          payload = {
-              "booking_id": booking_id,
-              "name": "GitHub Actions 10 second CI smoke",
-              "description": "Auto-created by Self-Hosted-Runner-HandsOn workflow.",
-              "steps": [
-                  {
-                      "id": "wait_10s",
-                      "name": "Reset board and wait 10 seconds",
-                      "do": {
-                          "type": "action",
-                          "target": "board",
-                          "command": "reset",
-                          "parameters": {
-                              "strategy": "serial_command",
-                          },
-                      },
-                      "wait": {
-                          "type": "delay",
+          # Registry keys from _COMMAND_REGISTRY in api/ci_jobs.py -- these are
+          # the only public command names the API accepts. There is no nested
+          # do/wait/expect/on_failure schema; commands are flat and keyed by
+          # name.
+          job_specs = {
+              "wait": {
+                  "request_id": "gha-wait-001",
+                  "name": "GitHub Actions wait job",
+                  "duration_seconds": 15,
+                  "commands": [
+                      {
+                          "id": "wait-10s",
+                          "name": "Wait 10 seconds",
+                          "command": "delay",
+                          "attempts": 1,
                           "timeout_ms": 10000,
+                      }
+                  ],
+              },
+              "serial": {
+                  "request_id": "gha-serial-001",
+                  "name": "GitHub Actions serial job",
+                  "duration_seconds": 10,
+                  "commands": [
+                      {
+                          "id": "mcu-serial",
+                          "name": "MCU serial capture",
+                          "command": "mcu.serial_log",
+                          "attempts": 1,
+                          "timeout_ms": 2000,
+                          "parameters": {"filename": "gha-mcu.log"},
                       },
-                      "expect": {
-                          "source": "operation.result",
-                          "operator": "exists",
+                      {
+                          "id": "mpu-serial",
+                          "name": "MPU serial capture",
+                          "command": "mpu.serial_log",
+                          "attempts": 1,
+                          "timeout_ms": 2000,
+                          "parameters": {"filename": "gha-mpu.log"},
                       },
-                      "on_failure": {
-                          "retries": 0,
-                          "stop_job": True,
-                      },
-                  }
-              ],
+                  ],
+              },
+              "camera": {
+                  "request_id": "gha-camera-001",
+                  "name": "GitHub Actions camera job",
+                  "duration_seconds": 10,
+                  "commands": [
+                      {
+                          "id": "camera-shot",
+                          "name": "Capture camera screenshot",
+                          "command": "camera.screenshot",
+                          "attempts": 1,
+                          "timeout_ms": 5000,
+                          "parameters": {"filename": "gha-frame.jpg"},
+                      }
+                  ],
+              },
           }
 
-          request = urllib.request.Request(
-              f"{backend_url}/api/v1/jobs",
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              job = json.loads(response.read().decode("utf-8"))
+          job_ids = {}
+          for label, spec in job_specs.items():
+              payload = {"booking_id": booking_id, **spec}
+              request = urllib.request.Request(
+                  f"{backend_url}/v1/ci/jobs",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  job = json.loads(response.read().decode("utf-8"))
 
-          with open("artifacts/ci-job-created.json", "w", encoding="utf-8") as job_file:
-              json.dump(job, job_file, indent=2)
-              job_file.write("\n")
+              with open(
+                  f"artifacts/ci-job-{label}-created.json", "w", encoding="utf-8"
+              ) as job_file:
+                  json.dump(job, job_file, indent=2)
+                  job_file.write("\n")
 
-          job_id = job.get("id")
-          if not job_id:
-              raise SystemExit("CI job creation response is missing id.")
+              job_id = job.get("id")
+              if not job_id:
+                  raise SystemExit(f"{label} job creation response is missing id.")
+
+              job_ids[label] = job_id
+              print(f"Created {label} CI job: {job_id}")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"ECW_CI_JOB_ID={job_id}\n")
-
-          print(f"Created CI job: {job_id}")
+              env_file.write(f"ECW_CI_JOB_IDS={json.dumps(job_ids)}\n")
           PY
 
-      - name: Poll CI job status and report result
+      - name: Poll CI jobs and report results
         run: |
           set -euo pipefail
 
@@ -304,9 +337,14 @@ jobs:
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
           token = os.environ["ECW_TOKEN"]
-          job_id = os.environ["ECW_CI_JOB_ID"]
+          job_ids = json.loads(os.environ["ECW_CI_JOB_IDS"])
           timeout_seconds = int(os.environ["JOB_WAIT_TIMEOUT_SECONDS"])
           artifact_dir = Path("artifacts")
+
+          # Real terminal statuses from JobStatus in api/ci_jobs.py -- there is
+          # no "passed" value, jobs that finish successfully report
+          # "succeeded".
+          TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "invalid"}
 
           def get_json(path: str) -> dict:
               request = urllib.request.Request(
@@ -316,63 +354,69 @@ jobs:
               with urllib.request.urlopen(request, timeout=10) as response:
                   return json.loads(response.read().decode("utf-8"))
 
-          deadline = time.monotonic() + timeout_seconds
-          final_job = None
+          summary_lines = ["# ECW CI Job Smoke Result", ""]
+          any_failed = False
 
-          while True:
-              job = get_json(f"/api/v1/jobs/{job_id}")
-              status = str(job.get("status", "")).lower()
-              print(f"CI job {job_id} status: {status}")
+          for label, job_id in job_ids.items():
+              deadline = time.monotonic() + timeout_seconds
+              final_job = None
 
-              if status in {"passed", "failed", "cancelled"}:
-                  final_job = job
-                  break
+              while True:
+                  job = get_json(f"/v1/ci/jobs/{job_id}")
+                  status = str(job.get("status", "")).lower()
+                  print(f"{label} CI job {job_id} status: {status}")
 
-              if time.monotonic() > deadline:
-                  final_job = job
-                  status = "timeout"
-                  print(f"CI job {job_id} did not finish within {timeout_seconds}s.")
-                  break
+                  if status in TERMINAL_STATUSES:
+                      final_job = job
+                      break
 
-              time.sleep(2)
+                  if time.monotonic() > deadline:
+                      final_job = job
+                      status = "timeout"
+                      print(f"{label} CI job {job_id} did not finish within {timeout_seconds}s.")
+                      break
 
-          logs = get_json(f"/api/v1/jobs/{job_id}/logs")
-          results = get_json(f"/api/v1/jobs/{job_id}/results")
+                  time.sleep(2)
 
-          (artifact_dir / "ci-job-final.json").write_text(
-              json.dumps(final_job, indent=2) + "\n",
-              encoding="utf-8",
+              logs = get_json(f"/v1/ci/jobs/{job_id}/logs")
+              results = get_json(f"/v1/ci/jobs/{job_id}/results")
+
+              (artifact_dir / f"ci-job-{label}-final.json").write_text(
+                  json.dumps(final_job, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              (artifact_dir / f"ci-job-{label}-logs.json").write_text(
+                  json.dumps(logs, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              (artifact_dir / f"ci-job-{label}-results.json").write_text(
+                  json.dumps(results, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+
+              final_status = str(final_job.get("status", "timeout")).lower()
+              summary_lines.append(f"- {label} job {job_id}: {final_status}")
+              if final_status != "succeeded":
+                  any_failed = True
+                  print(f"FAIL: {label} CI job {job_id} finished with status {final_status}.")
+              else:
+                  print(f"PASS: {label} CI job {job_id} succeeded.")
+
+          summary_lines.extend(
+              [
+                  "",
+                  f"- Booking ID: {os.environ.get('ECW_BOOKING_ID', '')}",
+                  f"- Board: {os.environ.get('ECW_BOARD_NAME', '')}",
+                  "",
+              ]
           )
-          (artifact_dir / "ci-job-logs.json").write_text(
-              json.dumps(logs, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          (artifact_dir / "ci-job-results.json").write_text(
-              json.dumps(results, indent=2) + "\n",
-              encoding="utf-8",
-          )
-
-          final_status = str(final_job.get("status", "timeout")).lower()
-          summary = [
-              "# ECW CI Job Smoke Result",
-              "",
-              f"- Job ID: {job_id}",
-              f"- Final status: {final_status}",
-              f"- Booking ID: {os.environ.get('ECW_BOOKING_ID', '')}",
-              f"- Board: {os.environ.get('ECW_BOARD_NAME', '')}",
-              "",
-          ]
           (artifact_dir / "ci-job-summary.md").write_text(
-              "\n".join(summary),
+              "\n".join(summary_lines),
               encoding="utf-8",
           )
 
-          if final_status == "passed":
-              print(f"PASS: CI job {job_id} passed.")
-              raise SystemExit(0)
-
-          print(f"FAIL: CI job {job_id} finished with status {final_status}.")
-          raise SystemExit(1)
+          if any_failed:
+              raise SystemExit(1)
           PY
 
       - name: End reservation
