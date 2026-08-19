@@ -15,9 +15,13 @@ on:
         required: true
         default: VIRTUAL-CI-SERIAL-CAMERA
       booking_wait_timeout_seconds:
-        description: Maximum seconds to wait for the auto booking to become active
+        description: >-
+          Maximum seconds to wait for the auto booking to become active.
+          Auto-booking searches up to 24h ahead for a free slot (see
+          autoBookBoard's search_until), so this defaults high enough to
+          cover that whole window rather than give up early.
         required: true
-        default: "180"
+        default: "86400"
       job_wait_timeout_seconds:
         description: Maximum seconds to wait for the CI jobs to finish
         required: true
@@ -26,7 +30,7 @@ on:
 env:
   ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
   BOARD_SEARCH: ${{ inputs.board_search || 'VIRTUAL-CI-SERIAL-CAMERA' }}
-  BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '180' }}
+  BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '86400' }}
   JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
 
 jobs:
@@ -174,6 +178,10 @@ jobs:
     name: "2. Wait: booking becomes active"
     runs-on: self-hosted
     needs: reserve
+    # GitHub's own job timeout defaults to 360 minutes and would kill this
+    # job regardless of BOOKING_WAIT_TIMEOUT_SECONDS. Auto-booking only
+    # searches up to 24h ahead, so give this a matching ceiling.
+    timeout-minutes: 1440
 
     env:
       ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
