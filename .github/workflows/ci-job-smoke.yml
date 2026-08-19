@@ -13,28 +13,33 @@ on:
       board_search:
         description: Board name text to search before auto-booking
         required: true
-        default: nrf
+        default: VIRTUAL-CI-SERIAL-CAMERA
       booking_wait_timeout_seconds:
         description: Maximum seconds to wait for the auto booking to become active
         required: true
         default: "180"
       job_wait_timeout_seconds:
-        description: Maximum seconds to wait for the CI job to finish
+        description: Maximum seconds to wait for the CI jobs to finish
         required: true
         default: "180"
 
+env:
+  ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
+  BOARD_SEARCH: ${{ inputs.board_search || 'VIRTUAL-CI-SERIAL-CAMERA' }}
+  BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '180' }}
+  JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
+
 jobs:
-  ci-job-smoke:
-    name: Auto-book board and run CI wait job
+  reserve:
+    name: "1. Reserve: auto-book a board"
     runs-on: self-hosted
+    outputs:
+      booking_id: ${{ steps.booking.outputs.booking_id }}
+      board_name: ${{ steps.board.outputs.board_name }}
 
     env:
-      ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
       ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
       ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
-      BOARD_SEARCH: ${{ inputs.board_search || 'nrf' }}
-      BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '180' }}
-      JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
 
     steps:
       - name: Check required secrets
@@ -75,6 +80,7 @@ jobs:
           echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
 
       - name: Select board type
+        id: board
         run: |
           set -euo pipefail
 
@@ -119,13 +125,14 @@ jobs:
           if not board_name:
               raise SystemExit("Selected board type did not include board_name.")
 
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"ECW_BOARD_NAME={board_name}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              output_file.write(f"board_name={board_name}\n")
 
           print(f"Selected board type: {board_name} (id: {selected.get('id')})")
           PY
 
       - name: Create auto booking
+        id: booking
         run: |
           set -euo pipefail
 
@@ -133,7 +140,7 @@ jobs:
             --request POST \
             --header "Authorization: Bearer ${ECW_TOKEN}" \
             --get \
-            --data-urlencode "board_name=${ECW_BOARD_NAME}" \
+            --data-urlencode "board_name=${{ steps.board.outputs.board_name }}" \
             "${ECW_BACKEND_URL%/}/auto-bookings")"
 
           echo "${booking_response}" > artifacts/booking.json
@@ -149,11 +156,50 @@ jobs:
           if not booking_id:
               raise SystemExit("Booking response is missing id.")
 
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"ECW_BOOKING_ID={booking_id}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              output_file.write(f"booking_id={booking_id}\n")
 
           print(f"Created booking: {booking_id}")
           PY
+
+      - name: Upload reserve artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-reserve-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+
+  wait:
+    name: "2. Wait: booking becomes active"
+    runs-on: self-hosted
+    needs: reserve
+
+    env:
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+
+    steps:
+      - name: Login and store token
+        run: |
+          set -euo pipefail
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
 
       - name: Wait for booking to become active
         run: |
@@ -220,9 +266,43 @@ jobs:
               time.sleep(wait_seconds)
           PY
 
+  test:
+    name: "3. Test: run wait, serial, and camera CI jobs"
+    runs-on: self-hosted
+    needs: [reserve, wait]
+
+    env:
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+      ECW_BOARD_NAME: ${{ needs.reserve.outputs.board_name }}
+
+    steps:
+      - name: Login and store token
+        run: |
+          set -euo pipefail
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
+
       - name: Create wait, serial, and camera CI jobs
         run: |
           set -euo pipefail
+
+          mkdir -p artifacts
 
           python3 <<'PY'
           import json
