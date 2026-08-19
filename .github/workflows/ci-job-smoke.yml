@@ -34,9 +34,18 @@ env:
   JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
 
 jobs:
-  reserve:
-    name: "1. Reserve: auto-book a board"
+  build:
+    name: Build
     runs-on: self-hosted
+    steps:
+      - name: No-op
+        run: |
+          echo "build - nothing to do yet"
+
+  reserve:
+    name: Reserve
+    runs-on: self-hosted
+    needs: build
     outputs:
       booking_id: ${{ steps.booking.outputs.booking_id }}
       board_name: ${{ steps.board.outputs.board_name }}
@@ -175,7 +184,7 @@ jobs:
           if-no-files-found: warn
 
   wait:
-    name: "2. Wait: booking becomes active"
+    name: Wait
     runs-on: self-hosted
     needs: reserve
     # GitHub's own job timeout defaults to 360 minutes and would kill this
@@ -274,10 +283,19 @@ jobs:
               time.sleep(wait_seconds)
           PY
 
-  test:
-    name: "3. Test: run wait, serial, and camera CI jobs"
+  upload:
+    name: Upload
     runs-on: self-hosted
-    needs: [reserve, wait]
+    needs: wait
+    steps:
+      - name: No-op
+        run: |
+          echo "upload - nothing to do yet"
+
+  test:
+    name: Test
+    runs-on: self-hosted
+    needs: [reserve, upload]
 
     env:
       ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
@@ -507,7 +525,59 @@ jobs:
               raise SystemExit(1)
           PY
 
-      - name: End reservation
+  collect:
+    name: Collect
+    runs-on: self-hosted
+    needs: test
+    if: always()
+    steps:
+      - name: Upload CI job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-job-smoke-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+
+  release:
+    name: Release
+    runs-on: self-hosted
+    needs: [reserve, collect]
+    if: always()
+
+    env:
+      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
+      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+
+    steps:
+      - name: Login and store token
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_BOOKING_ID:-}" ]; then
+            echo "No booking id available; skipping login."
+            exit 0
+          fi
+
+          login_response="$(curl --fail --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
+            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
+
+          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
+
+          if [ -z "${token}" ]; then
+            echo "Login response did not include a token."
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
+
+      - name: Cancel booking
         if: always()
         run: |
           set -euo pipefail
@@ -522,11 +592,3 @@ jobs:
             --get \
             --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
             "${ECW_BACKEND_URL%/}/cancel-booking"
-
-      - name: Upload CI job artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ecw-ci-job-smoke-${{ github.run_id }}
-          path: artifacts/
-          if-no-files-found: warn
