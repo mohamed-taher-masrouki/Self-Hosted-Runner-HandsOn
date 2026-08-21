@@ -51,16 +51,15 @@ jobs:
       board_name: ${{ steps.board.outputs.board_name }}
 
     env:
-      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
-      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
 
     steps:
       - name: Check required secrets
         run: |
           set -euo pipefail
 
-          if [ -z "${ECW_EMAIL}" ] || [ -z "${ECW_PASSWORD}" ]; then
-            echo "Missing ECW_EMAIL or ECW_PASSWORD repository secret."
+          if [ -z "${ECW_API_KEY}" ]; then
+            echo "Missing ECW_API_KEY repository secret."
             exit 1
           fi
 
@@ -72,26 +71,6 @@ jobs:
             "${ECW_BACKEND_URL%/}/docs" \
             --output /dev/null
 
-      - name: Login and store token
-        run: |
-          set -euo pipefail
-
-          login_response="$(curl --fail --silent --show-error \
-            --request POST \
-            --header "Content-Type: application/json" \
-            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
-            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
-
-          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
-
-          if [ -z "${token}" ]; then
-            echo "Login response did not include a token."
-            exit 1
-          fi
-
-          echo "::add-mask::${token}"
-          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
-
       - name: Select board type
         id: board
         run: |
@@ -100,7 +79,7 @@ jobs:
           mkdir -p artifacts
 
           board_types_response="$(curl --fail --silent --show-error \
-            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --header "X-API-Key: ${ECW_API_KEY}" \
             "${ECW_BACKEND_URL%/}/board_types?page_no=1&page_size=100")"
 
           echo "${board_types_response}" > artifacts/board-types.json
@@ -151,7 +130,7 @@ jobs:
 
           booking_response="$(curl --fail --silent --show-error \
             --request POST \
-            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --header "X-API-Key: ${ECW_API_KEY}" \
             --get \
             --data-urlencode "board_name=${{ steps.board.outputs.board_name }}" \
             "${ECW_BACKEND_URL%/}/auto-bookings")"
@@ -193,31 +172,10 @@ jobs:
     timeout-minutes: 1440
 
     env:
-      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
-      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
       ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
 
     steps:
-      - name: Login and store token
-        run: |
-          set -euo pipefail
-
-          login_response="$(curl --fail --silent --show-error \
-            --request POST \
-            --header "Content-Type: application/json" \
-            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
-            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
-
-          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
-
-          if [ -z "${token}" ]; then
-            echo "Login response did not include a token."
-            exit 1
-          fi
-
-          echo "::add-mask::${token}"
-          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
-
       - name: Wait for booking to become active
         run: |
           set -euo pipefail
@@ -231,7 +189,7 @@ jobs:
           from datetime import datetime, timezone
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
-          token = os.environ["ECW_TOKEN"]
+          api_key = os.environ["ECW_API_KEY"]
           booking_id = os.environ["ECW_BOOKING_ID"]
           timeout_seconds = int(os.environ["BOOKING_WAIT_TIMEOUT_SECONDS"])
 
@@ -247,7 +205,7 @@ jobs:
               query = urllib.parse.urlencode({"booking_id": booking_id})
               request = urllib.request.Request(
                   f"{backend_url}/booking?{query}",
-                  headers={"Authorization": f"Bearer {token}"},
+                  headers={"X-API-Key": api_key},
               )
               with urllib.request.urlopen(request, timeout=10) as response:
                   return json.loads(response.read().decode("utf-8"))
@@ -298,32 +256,11 @@ jobs:
     needs: [reserve, upload]
 
     env:
-      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
-      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
       ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
       ECW_BOARD_NAME: ${{ needs.reserve.outputs.board_name }}
 
     steps:
-      - name: Login and store token
-        run: |
-          set -euo pipefail
-
-          login_response="$(curl --fail --silent --show-error \
-            --request POST \
-            --header "Content-Type: application/json" \
-            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
-            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
-
-          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
-
-          if [ -z "${token}" ]; then
-            echo "Login response did not include a token."
-            exit 1
-          fi
-
-          echo "::add-mask::${token}"
-          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
-
       - name: Create wait, serial, and camera CI jobs
         run: |
           set -euo pipefail
@@ -336,7 +273,7 @@ jobs:
           import urllib.request
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
-          token = os.environ["ECW_TOKEN"]
+          api_key = os.environ["ECW_API_KEY"]
           booking_id = int(os.environ["ECW_BOOKING_ID"])
 
           # Registry keys from _COMMAND_REGISTRY in api/ci_jobs.py -- these are
@@ -405,7 +342,7 @@ jobs:
                   f"{backend_url}/v1/ci/jobs",
                   data=json.dumps(payload).encode("utf-8"),
                   headers={
-                      "Authorization": f"Bearer {token}",
+                      "X-API-Key": api_key,
                       "Content-Type": "application/json",
                   },
                   method="POST",
@@ -442,7 +379,7 @@ jobs:
           from pathlib import Path
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
-          token = os.environ["ECW_TOKEN"]
+          api_key = os.environ["ECW_API_KEY"]
           job_ids = json.loads(os.environ["ECW_CI_JOB_IDS"])
           timeout_seconds = int(os.environ["JOB_WAIT_TIMEOUT_SECONDS"])
           artifact_dir = Path("artifacts")
@@ -455,7 +392,7 @@ jobs:
           def get_json(path: str) -> dict:
               request = urllib.request.Request(
                   f"{backend_url}{path}",
-                  headers={"Authorization": f"Bearer {token}"},
+                  headers={"X-API-Key": api_key},
               )
               with urllib.request.urlopen(request, timeout=10) as response:
                   return json.loads(response.read().decode("utf-8"))
@@ -538,7 +475,7 @@ jobs:
           from pathlib import Path
 
           backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
-          token = os.environ["ECW_TOKEN"]
+          api_key = os.environ["ECW_API_KEY"]
           job_ids = json.loads(os.environ["ECW_CI_JOB_IDS"])
           artifact_dir = Path("artifacts")
           artifact_dir.mkdir(exist_ok=True)
@@ -546,7 +483,7 @@ jobs:
           for label, job_id in job_ids.items():
               request = urllib.request.Request(
                   f"{backend_url}/v1/ci/jobs/{job_id}/artifacts.zip",
-                  headers={"Authorization": f"Bearer {token}"},
+                  headers={"X-API-Key": api_key},
               )
               try:
                   with urllib.request.urlopen(request, timeout=30) as response:
@@ -581,49 +518,22 @@ jobs:
     if: always()
 
     env:
-      ECW_EMAIL: ${{ secrets.ECW_EMAIL }}
-      ECW_PASSWORD: ${{ secrets.ECW_PASSWORD }}
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
       ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
 
     steps:
-      - name: Login and store token
-        if: always()
-        run: |
-          set -euo pipefail
-
-          if [ -z "${ECW_BOOKING_ID:-}" ]; then
-            echo "No booking id available; skipping login."
-            exit 0
-          fi
-
-          login_response="$(curl --fail --silent --show-error \
-            --request POST \
-            --header "Content-Type: application/json" \
-            --data "{\"email\":\"${ECW_EMAIL}\",\"password\":\"${ECW_PASSWORD}\"}" \
-            "${ECW_BACKEND_URL%/}/auth/jwt/login")"
-
-          token="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("token", ""))' <<<"${login_response}")"
-
-          if [ -z "${token}" ]; then
-            echo "Login response did not include a token."
-            exit 1
-          fi
-
-          echo "::add-mask::${token}"
-          echo "ECW_TOKEN=${token}" >> "${GITHUB_ENV}"
-
       - name: Cancel booking
         if: always()
         run: |
           set -euo pipefail
 
-          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_TOKEN:-}" ]; then
-            echo "No booking/token available; skipping reservation cleanup."
+          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_API_KEY:-}" ]; then
+            echo "No booking/API key available; skipping reservation cleanup."
             exit 0
           fi
 
           curl --fail --silent --show-error \
-            --header "Authorization: Bearer ${ECW_TOKEN}" \
+            --header "X-API-Key: ${ECW_API_KEY}" \
             --get \
             --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
             "${ECW_BACKEND_URL%/}/cancel-booking"
