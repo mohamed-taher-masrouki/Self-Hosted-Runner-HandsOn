@@ -525,6 +525,41 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Download CI job artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
+          token = os.environ["ECW_TOKEN"]
+          job_ids = json.loads(os.environ["ECW_CI_JOB_IDS"])
+          artifact_dir = Path("artifacts")
+          artifact_dir.mkdir(exist_ok=True)
+
+          for label, job_id in job_ids.items():
+              request = urllib.request.Request(
+                  f"{backend_url}/v1/ci/jobs/{job_id}/artifacts.zip",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      data = response.read()
+              except urllib.error.HTTPError as exc:
+                  print(f"WARN: failed to download artifacts for {label} job {job_id}: {exc}")
+                  continue
+
+              out_path = artifact_dir / f"ci-job-{label}-artifacts.zip"
+              out_path.write_bytes(data)
+              print(f"Downloaded {label} CI job {job_id} artifacts -> {out_path}")
+          PY
+
   collect:
     name: Collect
     runs-on: self-hosted
