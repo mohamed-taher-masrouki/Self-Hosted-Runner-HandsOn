@@ -54,6 +54,9 @@ jobs:
       ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Check required secrets
         run: |
           set -euo pipefail
@@ -103,6 +106,9 @@ jobs:
       ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Wait for booking to become active
         run: python3 .github/scripts/wait_for_booking.py
 
@@ -126,6 +132,9 @@ jobs:
       ECW_BOARD_NAME: ${{ needs.reserve.outputs.board_name }}
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Create wait, serial, and camera CI jobs
         run: python3 .github/scripts/create_jobs.py
 
