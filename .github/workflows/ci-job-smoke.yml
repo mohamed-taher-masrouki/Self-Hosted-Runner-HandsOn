@@ -3,17 +3,17 @@ name: ECW CI Job Smoke
 on:
   push:
     branches:
-      - develop
+      - develop_dev
   workflow_dispatch:
     inputs:
       backend_url:
         description: ECW backend base URL reachable from the self-hosted runner
         required: true
-        default: http://localhost:8002
+        default: https://api-dev.edgebench.io
       board_search:
         description: Board name text to search before auto-booking
         required: true
-        default: VIRTUAL-CI-SERIAL-CAMERA
+        default: Arduino UNO R4 WiFi
       booking_wait_timeout_seconds:
         description: >-
           Maximum seconds to wait for the auto booking to become active.
@@ -28,8 +28,8 @@ on:
         default: "180"
 
 env:
-  ECW_BACKEND_URL: ${{ inputs.backend_url || 'http://localhost:8002' }}
-  BOARD_SEARCH: ${{ inputs.board_search || 'VIRTUAL-CI-SERIAL-CAMERA' }}
+  ECW_BACKEND_URL: ${{ inputs.backend_url || 'https://api-dev.edgebench.io' }}
+  BOARD_SEARCH: ${{ inputs.board_search || 'Arduino UNO R4 WiFi' }}
   BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '86400' }}
   JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
 
