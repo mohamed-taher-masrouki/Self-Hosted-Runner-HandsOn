@@ -7,6 +7,11 @@ import os
 import urllib.parse
 import urllib.request
 
+# The default urllib User-Agent ("Python-urllib/x.y") is blocked by the WAF
+# in front of the dev/staging backends, so every request needs a UA that
+# doesn't match that bot signature.
+USER_AGENT = "ecw-ci-smoke-script"
+
 
 def request_json(
     url: str,
@@ -20,7 +25,7 @@ def request_json(
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
 
-    headers = {"X-API-Key": api_key}
+    headers = {"X-API-Key": api_key, "User-Agent": USER_AGENT}
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -32,7 +37,9 @@ def request_json(
 
 
 def request_bytes(url: str, api_key: str, *, timeout: float = 30) -> bytes:
-    request = urllib.request.Request(url, headers={"X-API-Key": api_key})
+    request = urllib.request.Request(
+        url, headers={"X-API-Key": api_key, "User-Agent": USER_AGENT}
+    )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
 

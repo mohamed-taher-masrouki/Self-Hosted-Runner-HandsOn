@@ -91,4 +91,4 @@ if [ -z "$API_KEY" ]; then
 fi
 
 echo "API key generated." >&2
-echo "$API_KEY"
+printf '%s' "$API_KEY"
