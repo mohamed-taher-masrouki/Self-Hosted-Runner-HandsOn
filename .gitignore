@@ -59,3 +59,6 @@ __pycache__/
 .ecw_dev_api_key
 .env
 .env.*
+
+# local firmware build output
+/build/
