@@ -1,18 +1,38 @@
 // Flashed onto the Arduino UNO R4 WiFi by the ECW CI Job Smoke workflow.
 //
-// Change `val` below and open a PR to change what gets printed over serial.
-// The CI serial job captures the printed line; the CI camera job captures a
-// photo of the board so you can see the LED lit.
+// Change `val` below and open a PR to change what gets printed over serial
+// and scrolled across the onboard 12x8 LED matrix. The CI serial job
+// captures the printed line; the CI camera job captures a photo of the
+// board so you can see the LED lit and the matrix mid-scroll.
+//
+// ArduinoGraphics must be included BEFORE Arduino_LED_Matrix.
+#include "ArduinoGraphics.h"
+#include "Arduino_LED_Matrix.h"
+
 const int val = 1;
+
+ArduinoLEDMatrix matrix;
 
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
+  matrix.begin();
 }
 
 void loop() {
   Serial.print("Your value is ");
   Serial.println(val);
-  delay(1000);
+
+  char text[32];
+  snprintf(text, sizeof(text), "  Value: %d  ", val);
+
+  matrix.beginDraw();
+  matrix.stroke(0xFFFFFFFF);
+  matrix.textScrollSpeed(50);
+  matrix.textFont(Font_5x7);
+  matrix.beginText(0, 1, 0xFFFFFF);
+  matrix.println(text);
+  matrix.endText(SCROLL_LEFT);
+  matrix.endDraw();
 }

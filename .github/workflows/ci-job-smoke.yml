@@ -61,6 +61,15 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install "${ARDUINO_CORE}"
 
+      - name: Install Arduino libraries
+        run: |
+          set -euo pipefail
+
+          # ArduinoGraphics renders the scrolling text on the onboard LED
+          # matrix; unlike Arduino_LED_Matrix it isn't bundled with the core.
+          arduino-cli lib update-index
+          arduino-cli lib install "ArduinoGraphics"
+
       - name: Compile firmware
         run: |
           set -euo pipefail
