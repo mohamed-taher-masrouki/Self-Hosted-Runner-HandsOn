@@ -38,6 +38,15 @@ on:
         description: Session end, ISO-8601 (injected by ECW)
         required: false
         default: ""
+      activation_nonce:
+        description: >-
+          One-time claim token (injected by ECW). GitHub's workflow_dispatch
+          has no delivery idempotency key, so ECW can legitimately dispatch
+          the same logical trigger more than once (e.g. reclaiming a
+          dispatch it lost track of after a crash); every such duplicate
+          carries this same value. This run's first job calls back into ECW
+          to claim it -- only the first run to do so proceeds past that job.
+        required: true
       run_id:
         description: Stage 1 run id that built the firmware
         required: true
@@ -60,9 +69,49 @@ env:
   JOB_WAIT_TIMEOUT_SECONDS: "90"
 
 jobs:
+  claim:
+    name: Claim run
+    runs-on: self-hosted
+    timeout-minutes: 2
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+    steps:
+      - name: Claim this trigger's single execution slot
+        id: claim
+        run: |
+          set -uo pipefail
+
+          http_code="$(
+            curl --silent --show-error --max-time 30 --output /tmp/claim-resp.txt \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Content-Type: application/json" \
+              --data "{\"nonce\": \"${{ inputs.activation_nonce }}\"}" \
+              "${ECW_BACKEND_URL%/}/v1/ci/bookings/${ECW_BOOKING_ID}/activation-trigger/claim-run"
+          )"
+
+          case "${http_code}" in
+            204)
+              echo "Claimed -- this is the run that does the real work."
+              echo "claimed=true" >> "$GITHUB_OUTPUT"
+              ;;
+            409)
+              echo "Already claimed by another run (expected for a duplicate dispatch)."
+              cat /tmp/claim-resp.txt || true
+              echo "claimed=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::claim-run returned unexpected HTTP ${http_code}"
+              cat /tmp/claim-resp.txt || true
+              exit 1
+              ;;
+          esac
+
   upload:
     name: Upload firmware
     runs-on: self-hosted
+    needs: claim
+    if: needs.claim.outputs.claimed == 'true'
     timeout-minutes: 10
     # The demo backend has no physical board, so /upload returns an error.
     # Keep the pipeline flowing and surface the backend's message.
@@ -120,7 +169,8 @@ jobs:
   test:
     name: Run HIL jobs
     runs-on: self-hosted
-    needs: upload
+    needs: [claim, upload]
+    if: needs.claim.outputs.claimed == 'true'
     timeout-minutes: 15
     continue-on-error: true
 
@@ -154,8 +204,10 @@ jobs:
   release:
     name: Release booking
     runs-on: self-hosted
-    needs: [upload, test]
-    if: always()
+    needs: [claim, upload, test]
+    # A run that lost the claim did none of this booking's work and must not
+    # release it out from under the run that is still doing that work.
+    if: always() && needs.claim.outputs.claimed == 'true'
 
     env:
       ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
