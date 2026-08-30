@@ -9,9 +9,8 @@ name: ECW CI Job Smoke (reserve + register)
 # booking context as inputs. No runner sits polling booking status.
 
 on:
-  push:
-    branches:
-      - develop_2
+  # Demo: reserve is manual only. You start it from the Actions tab; when the
+  # booked session becomes active ECW fires ci-job-active.yml.
   workflow_dispatch:
     inputs:
       backend_url:
