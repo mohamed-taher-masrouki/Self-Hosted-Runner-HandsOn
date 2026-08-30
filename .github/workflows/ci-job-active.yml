@@ -63,6 +63,7 @@ jobs:
   flash:
     name: Flash firmware
     runs-on: self-hosted
+    timeout-minutes: 10
     steps:
       - name: Announce
         run: |
@@ -92,7 +93,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl --fail --silent --show-error \
+          # --max-time so the step fails in a bounded time when no physical
+          # board is attached (the backend blocks trying to reach one).
+          curl --fail --silent --show-error --max-time 120 \
             --header "X-API-Key: ${ECW_API_KEY}" \
             --form "file=@build/led_value.ino.bin" \
             "${ECW_BACKEND_URL%/}/upload?booking_id=${ECW_BOOKING_ID}"
@@ -101,6 +104,7 @@ jobs:
     name: Run HIL jobs
     runs-on: self-hosted
     needs: flash
+    timeout-minutes: 15
 
     env:
       ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
@@ -149,7 +153,7 @@ jobs:
             exit 0
           fi
 
-          curl --silent --show-error \
+          curl --silent --show-error --max-time 30 \
             --header "X-API-Key: ${ECW_API_KEY}" \
             --get --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
             "${ECW_BACKEND_URL%/}/cancel-booking" || echo "release call failed (ignored)"
