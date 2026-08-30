@@ -1,94 +1,39 @@
 name: ECW CI Job Smoke (reserve + register)
 
-# Session-trigger flow, part 1 of 2.
+# Session-trigger flow, part 1 of 2 (demo).
 #
-# This workflow builds the firmware, reserves a board, and registers a
-# session-activation trigger with ECW. It then STOPS -- it does not wait for
-# the booking to become active. When ECW activates the session it fires the
-# ci-job-active.yml workflow (part 2) via workflow_dispatch, passing the
-# booking context as inputs. No runner sits polling booking status.
+# You start this manually from the Actions tab. It reserves a board and
+# registers a session-activation trigger with ECW, then STOPS -- no runner
+# sits polling booking status. When ECW activates the session it fires
+# ci-job-active.yml (part 2) via the workflow_dispatch REST API, passing the
+# booking context as inputs.
 
 on:
-  # Demo: reserve is manual only. You start it from the Actions tab; when the
-  # booked session becomes active ECW fires ci-job-active.yml.
   workflow_dispatch:
     inputs:
       backend_url:
         description: ECW backend base URL reachable from the self-hosted runner
         required: true
-        default: https://api-dev.edgebench.io
+        default: http://localhost:8002
       board_search:
         description: Board name text to search before auto-booking
         required: true
-        default: Arduino UNO R4 WiFi
+        default: STM32 DK
       active_ref:
         description: >-
-          Git ref the ECW-triggered ci-job-active.yml run should check out.
-          Defaults to the ref that started this run.
+          Git ref the ECW-triggered ci-job-active.yml run should check out /
+          run on. Defaults to the ref that started this run.
         required: false
         default: ""
 
 env:
-  ECW_BACKEND_URL: ${{ inputs.backend_url || 'https://api-dev.edgebench.io' }}
-  BOARD_SEARCH: ${{ inputs.board_search || 'Arduino UNO R4 WiFi' }}
-  FQBN: arduino:renesas_uno:unor4wifi
-  ARDUINO_CORE: arduino:renesas_uno
-  FIRMWARE_SKETCH: firmware/led_value
+  ECW_BACKEND_URL: ${{ inputs.backend_url }}
+  BOARD_SEARCH: ${{ inputs.board_search }}
 
 jobs:
-  build:
-    name: Build
-    runs-on: self-hosted
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install arduino-cli
-        run: |
-          set -euo pipefail
-
-          if ! command -v arduino-cli >/dev/null 2>&1; then
-            mkdir -p "$HOME/bin"
-            curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
-          fi
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Install Arduino core
-        run: |
-          set -euo pipefail
-
-          arduino-cli core update-index
-          arduino-cli core install "${ARDUINO_CORE}"
-
-      - name: Install Arduino libraries
-        run: |
-          set -euo pipefail
-
-          # ArduinoGraphics renders the text on the onboard LED matrix; unlike
-          # Arduino_LED_Matrix it isn't bundled with the core.
-          arduino-cli lib update-index
-          arduino-cli lib install "ArduinoGraphics"
-
-      - name: Compile firmware
-        run: |
-          set -euo pipefail
-
-          mkdir -p build
-          arduino-cli compile --fqbn "${FQBN}" "${FIRMWARE_SKETCH}" --output-dir build
-
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ecw-firmware-${{ github.run_id }}
-          path: build/led_value.ino.bin
-
   reserve:
     name: Reserve and register trigger
     runs-on: self-hosted
-    needs: build
-    outputs:
-      booking_id: ${{ steps.booking.outputs.booking_id }}
-      board_name: ${{ steps.board.outputs.board_name }}
 
     env:
       ECW_API_KEY: ${{ secrets.ECW_API_KEY }}

@@ -54,6 +54,10 @@ jobs:
   session-active:
     name: Session active (triggered by ECW)
     runs-on: self-hosted
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+
     steps:
       - name: Show the booking context ECW passed
         run: |
@@ -68,3 +72,21 @@ jobs:
           echo "  run_id        = ${{ inputs.run_id }}"
           echo "  sha           = ${{ inputs.sha }}"
           echo "  backend_url   = ${{ inputs.backend_url }}"
+
+      # <-- real flash / test steps would go here -->
+
+      - name: Release the booking
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -z "${{ inputs.booking_id }}" ] || [ -z "${ECW_API_KEY}" ] || [ -z "${{ inputs.backend_url }}" ]; then
+            echo "No booking / key / backend_url; skipping release."
+            exit 0
+          fi
+
+          # Best effort: don't fail the demo if cleanup errors.
+          curl --silent --show-error \
+            --header "X-API-Key: ${ECW_API_KEY}" \
+            --get --data-urlencode "booking_id=${{ inputs.booking_id }}" \
+            "${{ inputs.backend_url }}/cancel-booking" || echo "release call failed (ignored)"
