@@ -1,0 +1,149 @@
+name: ECW CI Job Active Session
+
+# Session-trigger flow, part 2 of 2.
+#
+# ECW fires this workflow via the workflow_dispatch REST API the moment the
+# booking made by ci-job-smoke.yml becomes active. ECW injects the booking
+# context (booking_id, board_*, starts_at, ends_at); ci-job-smoke.yml's
+# register step adds run_id / sha / backend_url so this run can pull that
+# run's firmware artifact, check out the same commit, and reach the same
+# backend.
+#
+# NOTE: for the workflow_dispatch REST API to accept a call, this file must
+# exist on the repository's DEFAULT branch. Merge it to the default branch
+# once; after that it can be iterated on any branch and dispatched with
+# active_ref pointing at that branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      booking_id:
+        description: ECW booking id (injected by ECW)
+        required: true
+      board_id:
+        description: Board id (injected by ECW)
+        required: false
+        default: ""
+      board_type_id:
+        description: Board type id (injected by ECW)
+        required: false
+        default: ""
+      board_name:
+        description: Board name (injected by ECW)
+        required: false
+        default: ""
+      starts_at:
+        description: Session start, ISO-8601 (injected by ECW)
+        required: false
+        default: ""
+      ends_at:
+        description: Session end, ISO-8601 (injected by ECW)
+        required: false
+        default: ""
+      run_id:
+        description: ci-job-smoke.yml run id that built the firmware
+        required: true
+      sha:
+        description: Commit the firmware was built from
+        required: true
+      backend_url:
+        description: ECW backend base URL
+        required: true
+
+# actions: read lets the flash job download the smoke run's artifact by run-id.
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ECW_BACKEND_URL: ${{ inputs.backend_url }}
+  ECW_BOOKING_ID: ${{ inputs.booking_id }}
+  ECW_BOARD_NAME: ${{ inputs.board_name }}
+  JOB_WAIT_TIMEOUT_SECONDS: "180"
+
+jobs:
+  flash:
+    name: Flash
+    runs-on: self-hosted
+    steps:
+      - name: Check out repository at the built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Download firmware artifact from the smoke run
+        uses: actions/download-artifact@v4
+        with:
+          name: ecw-firmware-${{ inputs.run_id }}
+          path: build
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Flash firmware to board
+        env:
+          ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            --header "X-API-Key: ${ECW_API_KEY}" \
+            --form "file=@build/led_value.ino.bin" \
+            "${ECW_BACKEND_URL%/}/upload?booking_id=${ECW_BOOKING_ID}"
+
+  test:
+    name: Test
+    runs-on: self-hosted
+    needs: flash
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+
+    steps:
+      - name: Check out repository at the built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Create wait, serial, and camera CI jobs
+        run: python3 .github/scripts/create_jobs.py
+
+      - name: Poll CI jobs and report results
+        run: python3 .github/scripts/poll_jobs.py
+
+      - name: Download CI job artifact bundles
+        if: always()
+        run: python3 .github/scripts/download_artifacts.py
+
+      - name: Upload CI job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-job-active-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+
+  release:
+    name: Release
+    runs-on: self-hosted
+    needs: [flash, test]
+    if: always()
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+
+    steps:
+      - name: Cancel booking
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_API_KEY:-}" ]; then
+            echo "No booking/API key available; skipping reservation cleanup."
+            exit 0
+          fi
+
+          curl --fail --silent --show-error \
+            --header "X-API-Key: ${ECW_API_KEY}" \
+            --get \
+            --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
+            "${ECW_BACKEND_URL%/}/cancel-booking"

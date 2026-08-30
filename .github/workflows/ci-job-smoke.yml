@@ -1,9 +1,17 @@
-name: ECW CI Job Smoke
+name: ECW CI Job Smoke (reserve + register)
+
+# Session-trigger flow, part 1 of 2.
+#
+# This workflow builds the firmware, reserves a board, and registers a
+# session-activation trigger with ECW. It then STOPS -- it does not wait for
+# the booking to become active. When ECW activates the session it fires the
+# ci-job-active.yml workflow (part 2) via workflow_dispatch, passing the
+# booking context as inputs. No runner sits polling booking status.
 
 on:
   push:
     branches:
-      - develop_dev
+      - develop_2
   workflow_dispatch:
     inputs:
       backend_url:
@@ -14,24 +22,16 @@ on:
         description: Board name text to search before auto-booking
         required: true
         default: Arduino UNO R4 WiFi
-      booking_wait_timeout_seconds:
+      active_ref:
         description: >-
-          Maximum seconds to wait for the auto booking to become active.
-          Auto-booking searches up to 24h ahead for a free slot (see
-          autoBookBoard's search_until), so this defaults high enough to
-          cover that whole window rather than give up early.
-        required: true
-        default: "86400"
-      job_wait_timeout_seconds:
-        description: Maximum seconds to wait for the CI jobs to finish
-        required: true
-        default: "180"
+          Git ref the ECW-triggered ci-job-active.yml run should check out.
+          Defaults to the ref that started this run.
+        required: false
+        default: ""
 
 env:
   ECW_BACKEND_URL: ${{ inputs.backend_url || 'https://api-dev.edgebench.io' }}
   BOARD_SEARCH: ${{ inputs.board_search || 'Arduino UNO R4 WiFi' }}
-  BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds || '86400' }}
-  JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds || '180' }}
   FQBN: arduino:renesas_uno:unor4wifi
   ARDUINO_CORE: arduino:renesas_uno
   FIRMWARE_SKETCH: firmware/led_value
@@ -65,8 +65,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ArduinoGraphics renders the scrolling text on the onboard LED
-          # matrix; unlike Arduino_LED_Matrix it isn't bundled with the core.
+          # ArduinoGraphics renders the text on the onboard LED matrix; unlike
+          # Arduino_LED_Matrix it isn't bundled with the core.
           arduino-cli lib update-index
           arduino-cli lib install "ArduinoGraphics"
 
@@ -84,7 +84,7 @@ jobs:
           path: build/led_value.ino.bin
 
   reserve:
-    name: Reserve
+    name: Reserve and register trigger
     runs-on: self-hosted
     needs: build
     outputs:
@@ -93,6 +93,7 @@ jobs:
 
     env:
       ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+      ECW_DISPATCH_PAT: ${{ secrets.ECW_DISPATCH_PAT }}
 
     steps:
       - name: Check out repository
@@ -104,6 +105,10 @@ jobs:
 
           if [ -z "${ECW_API_KEY}" ]; then
             echo "Missing ECW_API_KEY repository secret."
+            exit 1
+          fi
+          if [ -z "${ECW_DISPATCH_PAT}" ]; then
+            echo "Missing ECW_DISPATCH_PAT repository secret (fine-grained PAT, Actions: Read and write)."
             exit 1
           fi
 
@@ -125,6 +130,13 @@ jobs:
           ECW_BOARD_NAME: ${{ steps.board.outputs.board_name }}
         run: python3 .github/scripts/find_or_create_booking.py
 
+      - name: Register session-activation trigger
+        env:
+          ECW_BOOKING_ID: ${{ steps.booking.outputs.booking_id }}
+          ECW_ACTIVE_WORKFLOW: ci-job-active.yml
+          ECW_ACTIVE_REF: ${{ inputs.active_ref }}
+        run: python3 .github/scripts/register_activation_trigger.py
+
       - name: Upload reserve artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -132,113 +144,3 @@ jobs:
           name: ecw-ci-reserve-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: warn
-
-  wait:
-    name: Wait
-    runs-on: self-hosted
-    needs: reserve
-    # GitHub's own job timeout defaults to 360 minutes and would kill this
-    # job regardless of BOOKING_WAIT_TIMEOUT_SECONDS. Auto-booking only
-    # searches up to 24h ahead, so give this a matching ceiling.
-    timeout-minutes: 1440
-
-    env:
-      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
-      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Wait for booking to become active
-        run: python3 .github/scripts/wait_for_booking.py
-
-  upload:
-    name: Upload
-    runs-on: self-hosted
-    needs: [reserve, wait, build]
-
-    env:
-      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
-      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
-
-    steps:
-      - name: Download firmware artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ecw-firmware-${{ github.run_id }}
-          path: build
-
-      - name: Flash firmware to board
-        run: |
-          set -euo pipefail
-
-          curl --fail --silent --show-error \
-            --header "X-API-Key: ${ECW_API_KEY}" \
-            --form "file=@build/led_value.ino.bin" \
-            "${ECW_BACKEND_URL%/}/upload?booking_id=${ECW_BOOKING_ID}"
-
-  test:
-    name: Test
-    runs-on: self-hosted
-    needs: [reserve, upload]
-
-    env:
-      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
-      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
-      ECW_BOARD_NAME: ${{ needs.reserve.outputs.board_name }}
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Create wait, serial, and camera CI jobs
-        run: python3 .github/scripts/create_jobs.py
-
-      - name: Poll CI jobs and report results
-        run: python3 .github/scripts/poll_jobs.py
-
-      - name: Download CI job artifact bundles
-        if: always()
-        run: python3 .github/scripts/download_artifacts.py
-
-  collect:
-    name: Collect
-    runs-on: self-hosted
-    needs: test
-    if: always()
-    steps:
-      - name: Upload CI job artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ecw-ci-job-smoke-${{ github.run_id }}
-          path: artifacts/
-          if-no-files-found: warn
-
-  release:
-    name: Release
-    runs-on: self-hosted
-    needs: [reserve, collect]
-    if: always()
-
-    env:
-      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
-      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
-
-    steps:
-      - name: Cancel booking
-        if: always()
-        run: |
-          set -euo pipefail
-
-          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_API_KEY:-}" ]; then
-            echo "No booking/API key available; skipping reservation cleanup."
-            exit 0
-          fi
-
-          curl --fail --silent --show-error \
-            --header "X-API-Key: ${ECW_API_KEY}" \
-            --get \
-            --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
-            "${ECW_BACKEND_URL%/}/cancel-booking"

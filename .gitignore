@@ -62,3 +62,6 @@ __pycache__/
 
 # local firmware build output
 /build/
+
+# CI script output
+/artifacts/
