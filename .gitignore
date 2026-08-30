@@ -53,3 +53,15 @@ dkms.conf
 
 # debug information files
 *.dwo
+__pycache__/
+
+# local secrets
+.ecw_dev_api_key
+.env
+.env.*
+
+# local firmware build output
+/build/
+
+# CI script output
+/artifacts/
