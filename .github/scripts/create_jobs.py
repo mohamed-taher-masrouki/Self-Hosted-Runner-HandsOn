@@ -17,14 +17,14 @@ JOB_SPECS = {
     "wait": {
         "request_id": "gha-wait-001",
         "name": "GitHub Actions wait job",
-        "duration_seconds": 15,
+        "duration_seconds": 65,
         "commands": [
             {
-                "id": "wait-10s",
-                "name": "Wait 10 seconds",
+                "id": "wait-60s",
+                "name": "Wait 60 seconds",
                 "command": "delay",
                 "attempts": 1,
-                "timeout_ms": 10000,
+                "timeout_ms": 60000,
             }
         ],
     },
