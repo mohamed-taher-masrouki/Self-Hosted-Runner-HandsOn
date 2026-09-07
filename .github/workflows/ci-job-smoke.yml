@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       backend_url:
-        description: ECW backend base URL reachable from the self-hosted runner
+        description: ECW backend base URL reachable from GitHub-hosted runners
         required: true
         default: https://api-dev.edgebench.io
       board_search:
@@ -39,7 +39,7 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
 
   reserve:
     name: Reserve
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: build
     outputs:
       booking_id: ${{ steps.booking.outputs.booking_id }}
@@ -135,7 +135,7 @@ jobs:
 
   wait:
     name: Wait
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: reserve
     # GitHub's own job timeout defaults to 360 minutes and would kill this
     # job regardless of BOOKING_WAIT_TIMEOUT_SECONDS. Auto-booking only
@@ -155,7 +155,7 @@ jobs:
 
   upload:
     name: Upload
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: [reserve, wait, build]
 
     env:
@@ -180,7 +180,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: [reserve, upload]
 
     env:
@@ -204,7 +204,7 @@ jobs:
 
   collect:
     name: Collect
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: test
     if: always()
     steps:
@@ -218,7 +218,7 @@ jobs:
 
   release:
     name: Release
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: [reserve, collect]
     if: always()
 
