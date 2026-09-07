@@ -11,6 +11,9 @@ name: Stage 1 - Build & Reserve
 # context as inputs.
 
 on:
+  push:
+    branches:
+      - develop1
   workflow_dispatch:
     inputs:
       backend_url:
@@ -29,8 +32,11 @@ on:
         default: ""
 
 env:
-  ECW_BACKEND_URL: ${{ inputs.backend_url }}
-  BOARD_SEARCH: ${{ inputs.board_search }}
+  # inputs.* is only populated for workflow_dispatch -- a push-triggered run
+  # has no inputs at all, so fall back to the same defaults the manual
+  # inputs above use, rather than an empty ECW_BACKEND_URL/BOARD_SEARCH.
+  ECW_BACKEND_URL: ${{ inputs.backend_url || 'https://api-dev.edgebench.io' }}
+  BOARD_SEARCH: ${{ inputs.board_search || 'STM32 DK' }}
   FQBN: arduino:renesas_uno:unor4wifi
   ARDUINO_CORE: arduino:renesas_uno
   FIRMWARE_SKETCH: firmware/led_value
