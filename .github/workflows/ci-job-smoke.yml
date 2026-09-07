@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       backend_url:
-        description: ECW backend base URL reachable from the self-hosted runner
+        description: ECW backend base URL reachable from GitHub-hosted runners
         required: true
-        default: http://localhost:8002
+        default: https://api-dev.edgebench.io
       board_search:
         description: Board name text to search before auto-booking
         required: true
@@ -38,7 +38,7 @@ env:
 jobs:
   build:
     name: Build firmware
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -84,7 +84,7 @@ jobs:
 
   reserve:
     name: Reserve board & register trigger
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: build
     outputs:
       booking_id: ${{ steps.booking.outputs.booking_id }}
