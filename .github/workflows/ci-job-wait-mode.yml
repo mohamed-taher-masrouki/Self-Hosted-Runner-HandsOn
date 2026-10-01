@@ -1,0 +1,227 @@
+name: Wait Mode - Full HIL Smoke Test
+
+# The "old" flow, as opposed to the trigger-based Stage 1/Stage 2 pair: one
+# single workflow that builds, books, flashes, polls the booking until it's
+# active, runs the wait/serial/camera CI jobs, downloads their artifacts, and
+# releases the booking -- all on GitHub-hosted runners, no ECW_DISPATCH_PAT
+# needed (no workflow_dispatch REST callback from ECW at all).
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: ECW backend base URL reachable from GitHub-hosted runners
+        required: true
+        default: https://www.edgebench.io/api
+      board_search:
+        description: Board name text to search before auto-booking
+        required: true
+        default: Arduino UNO R4 WiFi
+      booking_wait_timeout_seconds:
+        description: How long to poll for the booking to become active
+        required: false
+        default: "120"
+      job_wait_timeout_seconds:
+        description: How long to poll each CI job for a terminal status
+        required: false
+        default: "180"
+
+env:
+  ECW_BACKEND_URL: ${{ inputs.backend_url }}
+  BOARD_SEARCH: ${{ inputs.board_search }}
+  ECW_BOOKING_WAIT_TIMEOUT_SECONDS: ${{ inputs.booking_wait_timeout_seconds }}
+  JOB_WAIT_TIMEOUT_SECONDS: ${{ inputs.job_wait_timeout_seconds }}
+  FQBN: arduino:renesas_uno:unor4wifi
+  ARDUINO_CORE: arduino:renesas_uno
+  FIRMWARE_SKETCH: firmware/led_value
+
+jobs:
+  build:
+    name: Build firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          set -euo pipefail
+          if ! command -v arduino-cli >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          fi
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Arduino core
+        run: |
+          set -euo pipefail
+          arduino-cli core update-index
+          arduino-cli core install "${ARDUINO_CORE}"
+
+      - name: Install Arduino libraries
+        run: |
+          set -euo pipefail
+          arduino-cli lib update-index
+          arduino-cli lib install "ArduinoGraphics"
+
+      - name: Compile firmware
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          arduino-cli compile --fqbn "${FQBN}" "${FIRMWARE_SKETCH}" --output-dir build
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-firmware-wait-${{ github.run_id }}
+          path: build/led_value.ino.bin
+
+  reserve:
+    name: Reserve
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      booking_id: ${{ steps.booking.outputs.booking_id }}
+      board_name: ${{ steps.board.outputs.board_name }}
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+          if [ -z "${ECW_API_KEY}" ]; then
+            echo "Missing ECW_API_KEY repository secret."
+            exit 1
+          fi
+
+      - name: Check backend health
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error "${ECW_BACKEND_URL%/}/docs" --output /dev/null
+
+      - name: Select board type
+        id: board
+        run: python3 .github/scripts/select_board.py
+
+      - name: Find or create booking
+        id: booking
+        env:
+          ECW_BOARD_NAME: ${{ steps.board.outputs.board_name }}
+        run: python3 .github/scripts/find_or_create_booking.py
+
+      - name: Upload reserve artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-reserve-wait-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+
+  wait:
+    name: Wait
+    runs-on: ubuntu-latest
+    needs: reserve
+    timeout-minutes: 10
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Wait for booking to become active
+        run: python3 .github/scripts/wait_for_booking.py
+
+  upload:
+    name: Upload
+    runs-on: ubuntu-latest
+    needs: [reserve, wait, build]
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+
+    steps:
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ecw-firmware-wait-${{ github.run_id }}
+          path: build
+
+      - name: Flash firmware to board
+        run: |
+          set -uo pipefail
+          http_code="$(
+            curl --silent --show-error --max-time 120 --output /tmp/upload-resp.txt \
+              --write-out '%{http_code}' \
+              --header "X-API-Key: ${ECW_API_KEY}" \
+              --form "file=@build/led_value.ino.bin" \
+              "${ECW_BACKEND_URL%/}/upload?booking_id=${ECW_BOOKING_ID}"
+          )"
+          echo "HTTP ${http_code}"
+          cat /tmp/upload-resp.txt || true
+          echo
+          [ "${http_code}" = "200" ]
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [reserve, upload]
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+      ECW_BOARD_NAME: ${{ needs.reserve.outputs.board_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create wait, serial, and camera CI jobs
+        run: python3 .github/scripts/create_jobs.py
+
+      - name: Poll CI jobs and report results
+        run: python3 .github/scripts/poll_jobs.py
+
+      - name: Download CI job artifact bundles
+        if: always()
+        run: python3 .github/scripts/download_artifacts.py
+
+      - name: Upload CI job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecw-ci-job-wait-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [reserve, test]
+    if: ${{ !cancelled() && needs.reserve.result == 'success' }}
+
+    env:
+      ECW_API_KEY: ${{ secrets.ECW_API_KEY }}
+      ECW_BOOKING_ID: ${{ needs.reserve.outputs.booking_id }}
+
+    steps:
+      - name: Cancel booking
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -z "${ECW_BOOKING_ID:-}" ] || [ -z "${ECW_API_KEY:-}" ]; then
+            echo "No booking/API key available; skipping reservation cleanup."
+            exit 0
+          fi
+          curl --fail --silent --show-error \
+            --header "X-API-Key: ${ECW_API_KEY}" \
+            --get --data-urlencode "booking_id=${ECW_BOOKING_ID}" \
+            "${ECW_BACKEND_URL%/}/cancel-booking"
