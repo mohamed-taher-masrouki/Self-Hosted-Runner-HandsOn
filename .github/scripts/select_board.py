@@ -1,4 +1,4 @@
-"""Selects a board type whose name contains BOARD_SEARCH and writes board_name."""
+"""Selects a board type whose name contains BOARD_NAME and writes board_name."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ecw_client import request_json, write_github_output  # noqa: E402
 def main() -> None:
     backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
     api_key = os.environ["ECW_API_KEY"]
-    search = os.environ["BOARD_SEARCH"].lower()
+    search = os.environ["BOARD_NAME"].lower()
 
     artifact_dir = Path("artifacts")
     artifact_dir.mkdir(exist_ok=True)

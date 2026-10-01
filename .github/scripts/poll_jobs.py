@@ -20,7 +20,7 @@ def main() -> None:
     backend_url = os.environ["ECW_BACKEND_URL"].rstrip("/")
     api_key = os.environ["ECW_API_KEY"]
     job_ids = json.loads(os.environ["ECW_CI_JOB_IDS"])
-    timeout_seconds = int(os.environ["JOB_WAIT_TIMEOUT_SECONDS"])
+    timeout_seconds = int(os.environ["ECW_JOB_WAIT_TIMEOUT_SECONDS"])
     artifact_dir = Path("artifacts")
     artifact_dir.mkdir(exist_ok=True)
 

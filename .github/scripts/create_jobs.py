@@ -1,4 +1,4 @@
-"""Creates the wait, serial, and camera CI jobs for the smoke test."""
+"""Creates the CI jobs defined as JSON files under .github/user/jobs/."""
 
 from __future__ import annotations
 
@@ -10,63 +10,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ecw_client import request_json, write_github_env  # noqa: E402
 
-# Registry keys from _COMMAND_REGISTRY in api/ci_jobs.py -- these are the
-# only public command names the API accepts. There is no nested
-# do/wait/expect/on_failure schema; commands are flat and keyed by name.
-JOB_SPECS = {
-    "wait": {
-        "request_id": "gha-wait-001",
-        "name": "GitHub Actions wait job",
-        "duration_seconds": 15,
-        "commands": [
-            {
-                "id": "wait-10s",
-                "name": "Wait 10 seconds",
-                "command": "delay",
-                "attempts": 1,
-                "timeout_ms": 10000,
-            }
-        ],
-    },
-    "serial": {
-        "request_id": "gha-serial-001",
-        "name": "GitHub Actions serial job",
-        "duration_seconds": 10,
-        "commands": [
-            {
-                "id": "mcu-serial",
-                "name": "MCU serial capture",
-                "command": "mcu.serial_log",
-                "attempts": 1,
-                "timeout_ms": 2000,
-                "parameters": {"filename": "gha-mcu.log"},
-            },
-            {
-                "id": "mpu-serial",
-                "name": "MPU serial capture",
-                "command": "mpu.serial_log",
-                "attempts": 1,
-                "timeout_ms": 2000,
-                "parameters": {"filename": "gha-mpu.log"},
-            },
-        ],
-    },
-    "camera": {
-        "request_id": "gha-camera-001",
-        "name": "GitHub Actions camera job",
-        "duration_seconds": 10,
-        "commands": [
-            {
-                "id": "camera-shot",
-                "name": "Capture camera screenshot",
-                "command": "camera.screenshot",
-                "attempts": 1,
-                "timeout_ms": 5000,
-                "parameters": {"filename": "gha-frame.jpg"},
-            }
-        ],
-    },
-}
+# Job payloads are project-owned data, not workflow logic: each JSON file
+# under .github/user/jobs/ is one CI job spec -- request_id/name/
+# duration_seconds/commands, keyed by command names from the
+# _COMMAND_REGISTRY in api/ci_jobs.py. This script never needs to change to
+# add/edit/reorder a CI job, only the files in that folder do.
+#
+# CI jobs run in creation order, so files are read in sorted filename order
+# and a leading "NN_" prefix (01_, 02_, ...) controls that order; the
+# prefix itself is stripped to make the label used for artifact filenames
+# and ECW_CI_JOB_IDS keys (e.g. "01_wait.json" -> "wait").
+JOBS_DIR = Path(__file__).resolve().parents[1] / "user" / "jobs"
+
+
+def _label(job_file: Path) -> str:
+    stem = job_file.stem
+    prefix, _, rest = stem.partition("_")
+    return rest if prefix.isdigit() and rest else stem
+
+
+def _loadJobSpecs() -> dict[str, dict]:
+    job_files = sorted(JOBS_DIR.glob("*.json"))
+    if not job_files:
+        raise SystemExit(f"No CI job specs found under {JOBS_DIR}.")
+    return {_label(job_file): json.loads(job_file.read_text(encoding="utf-8")) for job_file in job_files}
 
 
 def main() -> None:
@@ -78,7 +45,7 @@ def main() -> None:
     artifact_dir.mkdir(exist_ok=True)
 
     job_ids: dict[str, int] = {}
-    for label, spec in JOB_SPECS.items():
+    for label, spec in _loadJobSpecs().items():
         payload = {"booking_id": booking_id, **spec}
         job = request_json(
             f"{backend_url}/v1/ci/jobs",

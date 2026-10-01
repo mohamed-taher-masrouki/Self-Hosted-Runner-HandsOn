@@ -1,12 +1,15 @@
-"""Registers a session-activation trigger so ECW wakes the active-session
-workflow when the booking becomes active, instead of this run polling for it.
+"""Registers a session-activation trigger so ECW wakes the "Stage 2" workflow
+the moment this booking becomes active, instead of a runner sitting there
+polling for it (that's what the plain `wait` job in the main
+ci-job-smoke.yml pipeline does instead -- pick one pattern, not both).
 
 PUT /v1/ci/bookings/{booking_id}/activation-trigger
 
 ECW injects booking_id/board_id/board_type_id/board_name/starts_at/ends_at as
-workflow_dispatch inputs; we add run_id/sha/backend_url so the triggered run
-can fetch this run's firmware artifact, check out the same commit, and talk to
-the same backend.
+workflow_dispatch inputs when it fires Stage 2; this script adds
+run_id/sha/backend_url via inputs_extra so that triggered run can fetch this
+run's firmware artifact, check out the same commit, and talk to the same
+backend.
 """
 
 from __future__ import annotations
@@ -27,11 +30,14 @@ def main() -> None:
 
     dispatch_pat = os.environ.get("ECW_DISPATCH_PAT", "")
     if not dispatch_pat:
-        raise SystemExit("Missing ECW_DISPATCH_PAT secret (fine-grained PAT, Actions: RW).")
+        raise SystemExit(
+            "Missing ECW_DISPATCH_PAT repository secret (fine-grained PAT, "
+            "Actions: Read and write -- see docs/07-trigger-mode.md)."
+        )
 
     body = {
         "repository": os.environ["GITHUB_REPOSITORY"],
-        "workflow": os.environ.get("ECW_ACTIVE_WORKFLOW", "ci-job-active.yml"),
+        "workflow": os.environ.get("ECW_ACTIVE_WORKFLOW", "ci-job-trigger-stage2.yml"),
         "git_ref": os.environ.get("ECW_ACTIVE_REF") or os.environ["GITHUB_REF_NAME"],
         "credential": dispatch_pat,
         "inputs_extra": {
